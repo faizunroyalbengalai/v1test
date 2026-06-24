@@ -70,39 +70,6 @@
             update_cache: yes
       when: python_version not in ('3', '')
 
-    # ── Local database installation ───────────────────────────────────────────
-    - name: Install MySQL server
-      apt:
-        name:
-          - mysql-server
-        state: present
-        update_cache: yes
-
-    - name: Ensure MySQL is started
-      systemd:
-        name: mysql
-        state: started
-        enabled: yes
-
-    - name: Wait for MySQL to be ready
-      wait_for:
-        port: 3306
-        host: 127.0.0.1
-        timeout: 60
-
-    - name: Create MySQL database and user
-      shell: |
-        DB_NAME="{{ deploy_db_name | default(project | replace('-', '_') + 'db', true) }}"
-        DB_USER="{{ deploy_db_username | default('appuser', true) }}"
-        DB_PASS="{{ deploy_db_password | default('apppass', true) }}"
-        mysql -u root -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\`;"
-        mysql -u root -e "CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';"
-        mysql -u root -e "ALTER USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';"
-        mysql -u root -e "GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';"
-        mysql -u root -e "FLUSH PRIVILEGES;"
-      args:
-        executable: /bin/bash
-
 
     - name: Install Nginx
       apt:

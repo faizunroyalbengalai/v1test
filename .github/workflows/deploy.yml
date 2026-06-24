@@ -88,11 +88,34 @@ jobs:
       - name: Terraform plan
         if: steps.check_ec2.outputs.exists != 'true'
         working-directory: terraform
+        env:
+          DB_NAME:     ${{ secrets.DB_NAME }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
+          # Sanitized audit: confirm the secrets actually arrived in this
+          # step. Lengths only — never log values. We use `wc -c` instead of
+          # bash's brace length syntax because that token collides with
+          # Jinja2 comment delimiters in this template.
+          DB_NAME_LEN=$(printf %s "$DB_NAME" | wc -c)
+          DB_USER_LEN=$(printf %s "$DB_USERNAME" | wc -c)
+          DB_PASS_LEN=$(printf %s "$DB_PASSWORD" | wc -c)
+          echo "DB_NAME       len=$DB_NAME_LEN"
+          echo "DB_USERNAME   len=$DB_USER_LEN"
+          echo "DB_PASSWORD   len=$DB_PASS_LEN"
+          if [ -z "$DB_PASSWORD" ] || [ "$DB_PASS_LEN" -lt 8 ]; then
+            echo "::error title=DB_PASSWORD missing or short::DB_PASSWORD GHA secret is empty or shorter than 8 chars (len=$DB_PASS_LEN). RDS rejects this as Invalid master password. Re-run UDAP so the worker re-pushes the secret, or set DB_PASSWORD manually."
+            exit 1
+          fi
+          EXTRA_ARGS=()
+          [ -n "$DB_NAME" ]     && EXTRA_ARGS+=(-var "db_name=$DB_NAME")
+          [ -n "$DB_USERNAME" ] && EXTRA_ARGS+=(-var "db_username=$DB_USERNAME")
+          EXTRA_ARGS+=(-var "db_password=$DB_PASSWORD")
           terraform plan \
             -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
+            "${EXTRA_ARGS[@]}" \
             -out=tfplan
       - name: Terraform apply
         if: steps.check_ec2.outputs.exists != 'true'
@@ -129,6 +152,54 @@ jobs:
               "cloud-init status --wait 2>/dev/null; echo ok" \
               && break || sleep 15
           done
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Resolve RDS endpoint
+        id: rds
+        env:
+          DEFAULT_PORT: "3306"
+          PROJECT:      ${{ secrets.PROJECT_NAME }}
+        run: |
+          # We resolve the endpoint here (in the configure job) rather than
+          # publishing it as a provision-job output. GHA scrubs job outputs
+          # whose values contain registered secret substrings — and an RDS
+          # endpoint embeds the project name, which itself is registered as
+          # a secret. So passing it via outputs silently zeroed the value.
+          ALL_INSTANCES=$(aws rds describe-db-instances --output json 2>&1) || {
+            echo "::error title=RDS describe failed::$ALL_INSTANCES"
+            exit 1
+          }
+          MATCH=$(echo "$ALL_INSTANCES" | jq -r --arg p "$PROJECT" \
+            '.DBInstances[]
+               | select(
+                   (.DBInstanceIdentifier == ($p + "-db"))
+                   or (.DBInstanceIdentifier == $p)
+                   or ((.TagList // []) | any(.Key == "Project" and .Value == $p))
+                 )
+               | [.Endpoint.Address, (.Endpoint.Port|tostring)]
+               | @tsv' \
+            | head -n 1)
+          ENDPOINT=""
+          PORT=""
+          if [ -n "$MATCH" ]; then
+            ENDPOINT=$(printf '%s' "$MATCH" | cut -f1)
+            PORT=$(printf '%s' "$MATCH" | cut -f2)
+          fi
+          PORT="${PORT:-$DEFAULT_PORT}"
+          if [ -z "$ENDPOINT" ]; then
+            echo "::error title=RDS endpoint missing::Could not find an RDS instance for project $PROJECT in region ${{ secrets.AWS_REGION }}. Make sure terraform apply created the aws_db_instance and that AWS_REGION matches the region it was created in."
+            exit 1
+          fi
+          # Step outputs in the SAME job are not scrubbed against secret
+          # values, so it is safe to write the endpoint here.
+          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "port=$PORT"         >> $GITHUB_OUTPUT
+          # Sanitized echo for the workflow log.
+          echo "Resolved RDS endpoint OK (port=$PORT)"
       - name: Run Ansible playbook
         working-directory: ansible
         env:
@@ -136,17 +207,33 @@ jobs:
           AWS_SECRET_ACCESS_KEY:     ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION:        ${{ secrets.AWS_REGION }}
           ANSIBLE_HOST_KEY_CHECKING: "False"
-          DEPLOY_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # All four fields come from this same job — endpoint/port from a
+          # step in this job, name/user from secrets directly. No values
+          # cross job boundaries (where GHA scrubs secret substrings).
+          DEPLOY_RDS_ENDPOINT: ${{ steps.rds.outputs.endpoint }}
+          DEPLOY_RDS_PORT:     ${{ steps.rds.outputs.port }}
           DEPLOY_DB_NAME:      ${{ secrets.DB_NAME }}
           DEPLOY_DB_USERNAME:  ${{ secrets.DB_USERNAME }}
           DEPLOY_DB_PASSWORD:  ${{ secrets.DB_PASSWORD }}
           DEPLOY_DB_TYPE:      ${{ secrets.DB_TYPE }}
+          DEPLOY_PROJECT:      ${{ secrets.PROJECT_NAME }}
         run: |
           # Pass DB connection details to Ansible as --extra-vars so the
           # playbook does not rely on `lookup('env', ...)` (which silently
           # returns empty when the env propagation chain breaks). Quoting is
           # important: the password may contain shell metacharacters.
           EXTRA_VARS=()
+          # Apply defaults for db name/username (these mirror what the
+          # Terraform module uses when the secrets are unset).
+          : "${DEPLOY_DB_USERNAME:=appuser}"
+          if [ -z "$DEPLOY_DB_NAME" ]; then
+            DEPLOY_DB_NAME="$(printf '%s' "$DEPLOY_PROJECT" | tr '-' '_')db"
+          fi
+          if [ -z "$DEPLOY_RDS_ENDPOINT" ]; then
+            echo "::error title=RDS endpoint missing::Resolve RDS endpoint step did not produce an endpoint. Aborting before we deploy a localhost-bound app."
+            exit 1
+          fi
+          DEPLOY_DATABASE_URL="mysql://${DEPLOY_DB_USERNAME}:${DEPLOY_DB_PASSWORD}@${DEPLOY_RDS_ENDPOINT}:${DEPLOY_RDS_PORT}/${DEPLOY_DB_NAME}"
           EXTRA_VARS+=(-e "deploy_database_url=${DEPLOY_DATABASE_URL}")
           EXTRA_VARS+=(-e "deploy_db_name=${DEPLOY_DB_NAME}")
           EXTRA_VARS+=(-e "deploy_db_username=${DEPLOY_DB_USERNAME}")

@@ -35,6 +35,19 @@ variable "instance_type" {
   type    = string
   default = "t3.micro"
 }
+variable "db_name" {
+  type    = string
+  default = ""
+}
+variable "db_username" {
+  type    = string
+  default = ""
+}
+variable "db_password" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
 
 data "aws_vpc" "default" {
   default = true
@@ -135,9 +148,65 @@ resource "aws_instance" "server" {
   }
 }
 
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.project_name}-db-subnet"
+  subnet_ids = data.aws_subnets.default.ids
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
+}
+
+resource "aws_security_group" "rds_sg" {
+  name        = "${var.project_name}-rds-sg"
+  description = "RDS security group"
+  vpc_id      = data.aws_vpc.default.id
+  ingress {
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.sg.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_db_instance" "main" {
+  identifier             = "${var.project_name}-db"
+  engine                 = "mysql"
+  engine_version         = "8.0"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+  storage_type           = "gp2"
+  db_name                = var.db_name != "" ? var.db_name : "${replace(var.project_name, "-", "_")}db"
+  username               = var.db_username != "" ? var.db_username : "appuser"
+  password               = var.db_password
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds_sg.id]
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
+}
+
 output "public_ip" {
   value = aws_instance.server.public_ip
 }
 output "instance_id" {
   value = aws_instance.server.id
+}
+output "rds_endpoint" {
+  value = aws_db_instance.main.address
+}
+output "rds_port" {
+  value = aws_db_instance.main.port
 }
